@@ -1,0 +1,481 @@
+---
+title: "Voltage - Substations Summary By Year"
+output: html_document
+params:
+  meteridentifier: "200420"
+  cut1: 0
+  cut2: 114
+  cut3: 120
+  cut4: 126
+  cut5: 140
+  lowpercent: 10
+  startdate: !r as.Date("2016-01-01")
+  enddate: !r as.Date("2017-01-01")
+  href: "file:///C:/Users/Craig%20Nicholson/Documents/GitHub/SubstationVoltageAnalysis/"
+  production: "J:/ElectSolve/Blue/Rcode/substationReport"
+  localwin: "C:/Users/Craig Nicholson/Documents/GitHub/SubstationVoltageAnalysis/"
+  localnix: "/Users/cn/rcode2_clean/Demo_20170403/"
+---
+
+```{r Setup, include=FALSE}
+knitr::opts_chunk$set(include=TRUE, echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+```{r Load Packages}
+library(memisc)       # this clashes with dplyr rename, and select
+                      # can i use something else
+library(ggplot2)
+library(ggExtra) # because remembering ggplot theme options is beyond me
+library(viridis)
+library(gridExtra)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+library(knitr)
+library(lubridate)    # working with dates
+
+```
+
+#### Updated: `r format(Sys.Date(), format="%A, %B %d %Y")`  (`r Sys.time()`) 
+
+```{r Functions}
+# Trim leading and trailing whitespaces
+trim <- function (x) gsub("^\\s+|\\s+$", "", x)
+```
+
+```{r Set Working Directory}
+setwd(params$localwin)
+```
+
+```{r Get the data via ODBC}
+# Step 1, create ODBC on the box to the database, where R is installed.
+#   this is for windows OS, and servers, and this can exist on the
+#   application server.
+
+# These only work on a windows box, and need to be uncommented when deployed
+#library(RODBC)       # need a way 
+#cnx <- odbcConnect("R",uid="electsolve",pwd="electsolve")
+ 
+dtReadDayFrom <- params$startdate 
+dtReadDayTo <- params$enddate
+sSQLcmd <- paste("
+                    SELECT 
+                       ROW_NUMBER() OVER (ORDER BY ReadDate) AS RowID
+                      ,[ODMReporting].[ODM].[IntervalReads].[MeterIdentifier] as 'Meter ID'
+                      ,[ODMReporting].[ODM].[IntervalReads].[ReadDate] as 'Read Date/Time'
+                      ,[ODMReporting].[ODM].[IntervalReads].[ReadValue] as 'Voltage'
+                      ,[ODMReporting].[ODM].[IntervalReads].[LocationNumber] as 'Location ID'
+	                    ,[MDM].[dbo].[Substation].[SubstationName] as 'Substation'
+                    FROM [ODMReporting].[ODM].[IntervalReads]
+                    join [MDM].[dbo].[Location]
+                    on [ODMReporting].[ODM].[IntervalReads].LocationNumber = [MDM].[dbo].[Location].LocationNumber
+                    join [MDM].[dbo].[Substation]
+                    on [MDM].[dbo].[Location].SubstationId = [MDM].[dbo].[Substation].SubstationId
+                    where MeterIdentifier = '", params$meteridentifier ,"' 
+                    and (UOM = 'Voltage')
+                    and (ReadQualityCode = 3)
+                    and (ReadDate > '",dtReadDayFrom,"' AND ReadDate <= '",dtReadDayTo,"')
+                    order by MeterIdentifier asc, ReadDate asc
+                  "
+                   ,sep="" ) 
+```
+
+```{r Load the Data}
+# Read date is in local time for both datasets CST or CDT
+#volts_raw <- sqlQuery(cnx, sSQLcmd)
+volts_raw <- read.csv("voltage_200420_2016.csv", header=TRUE) #38676 is from original query, v2 after delete is 38684
+#volts_raw <- subset(volts_raw,volts_raw$Meter.ID == "200420")
+
+```
+
+```{r Remove Duplicates}
+# First two tidy datasets for the raw data
+# remove duplicates for voltage and power factor datasets
+# had to add meter b/c the dupes were really not dupes just
+# exact same reading on the data and for different meter
+# and the meter data was not included in first output
+# volts_clean <- volts_raw  %>% 
+#   group_by(dtReadDate, Location, Substation, Voltage, Meter) %>% 
+#   filter(row_number() == 1)
+```
+
+```{r Voltage - Remove all zero values of V - we are not concerned with outages}
+
+# Remove all zero values, which indicates and outate
+zeros <- nrow(subset(volts_raw, volts_raw$V <= 0))
+volts_raw <- subset(volts_raw,volts_raw$V > 0)
+
+```
+
+```{r Voltage create new variable from 240v to 120v by dividing Voltage by 2}
+# Divide all the votlages by 2 since we have 240v want to see 120v instead
+# Save original value in new column to keep the original data idempotent, allowing us to re-run the same method multiple times.
+volts_raw$V <- volts_raw$Voltage / 2
+
+```
+
+```{r Data Clean Up and Formatting}
+# Gives us better column names
+names(volts_raw)[1] <- "_id"
+names(volts_raw)[2] <- "Meter"
+names(volts_raw)[3] <- "ReadDate"
+names(volts_raw)[4] <- "Voltage"
+names(volts_raw)[5] <- "Location"
+names(volts_raw)[6] <- "Substation"
+
+# Covert the chr date to POSIX
+# Save original value in new column to keep the original data idempotent, allowing us to re-run the same method multiple times.
+# This is the actual date of the interval reported from the endpoint
+volts_raw$dtReadDate <- parse_date_time(volts_raw$ReadDate, orders="ymd HMS")
+
+# Assumption all data is 15min intervals
+# Ending Interval for all dates will have prefix (i), and i.ReadDate is the main date
+# So when grouping use the i.dt's since they will be the day the intervals belong too
+# instead of dtReadDate
+# dtReadDate is the timestamp of the interval ending.
+# 3/1/2017 00:00:00 really belongs to 2.28.2017
+# See ending interval in Notes if you need further explanation
+volts_raw$i.dtReadDate <-  volts_raw$dtReadDate - minutes(15)
+
+#hm, used for reporting on the i.ReadDate for plots
+volts_raw$hm.end <- format(as.POSIXct(volts_raw$i.dtReadDate, 
+                           format="%Y-%m-%d %H:%M"),
+                           format="%H:%M")
+# Grouping and Rollups
+# Add day and hour, so we can group by day or hour, using i.dtReadDate
+# since ending interval will be the next day to keep consistency
+# and for reviewing for issues
+volts_raw$i.dtReadDay  <- floor_date(volts_raw$i.dtReadDate,"day")
+volts_raw$i.year  <- year(volts_raw$i.dtReadDate)
+volts_raw$i.month = month(volts_raw$i.dtReadDate, label=TRUE) #3 letter acroymn for US peeps
+volts_raw$i.day  <- day(volts_raw$i.dtReadDate)
+volts_raw$i.h <- hour(volts_raw$i.dtReadDate)
+# WeekDay (M-F, Sat, Sun)
+volts_raw$wday  <- wday(volts_raw$i.dtReadDay, label = TRUE)
+volts_raw$Meter <- factor(volts_raw$Meter)
+
+```
+
+```{r Voltage Trim Substation Name}
+# Trim and Upper the Substation Name for Consistency
+volts_raw$Substation <- trim(volts_raw$Substation)
+
+```
+
+```{r Voltage Create Buckets}
+# Create the buckets for the voltage
+# This could be different based on each country.  
+# These are US values from ANSI for 60Hz.
+# (  0, 114],  <= 114
+# (114, 126]   > 114 and <= 126
+# (126, 140]   > 126 and <= 140
+volts_raw$voltage.bucket <- cut(volts_raw$V,
+                                    breaks = c(params$cut1,
+                                               params$cut2,
+                                               params$cut3,
+                                               params$cut4,
+                                               params$cut5))
+                                               #labels=c('Low','Med', 'Best','High'))
+```
+
+
+```{r Scale the data between zero and one}
+
+volts_raw$V.scale <- volts_raw$V/max(volts_raw$V)
+
+```
+
+
+```{r Log Returns}
+
+# df2 <- volts_raw[,1:2]
+# for(name in names(volts_raw)[2:length(names(volts_raw))]){
+#     df2[,name] <- volts_raw[,name]
+#     df2[2:nrow(df2),paste0(name, ".Log")] <- diff(log(as.numeric(as.character(volts_raw))), lag = 1)
+# }
+
+
+
+
+# clean up data (convert strings to numbers)
+#df <- df %>% mutate_each(funs(as.numeric(as.character(.))), B126:H251)
+
+# calculate log diff and merge
+#df %>% merge(df %>% mutate_each(funs(c(NA,diff(log(.)))), B126:H251), by='Date', suffixes=c('','_log'))
+
+# optionally apply rounding function
+#df %>% mutate_each(funs(round(.,3)), B126_log:H251_log)
+
+```
+
+### Summary Statistics for - `r year(params$startdate)`
+Substations : : `r length(unique(volts_raw$Substation))`
+Meters collecting Voltage : `r length(unique(volts_raw$Meter))`  
+Total Intervals collected : `r count(volts_raw)`   
+Intervals with a voltage of zero removed : `r zeros`
+
+```{r Summary of Voltage, eval=FALSE}
+# Can I do this dynamically per month with group
+summary(volts_raw$V)
+```
+
+#### Histogram - Distribution of Voltage
+
+```{r Histogram, fig.height=8, fig.width=16}
+      ggplot(data=volts_raw,aes(x=volts_raw$V)) +
+        geom_histogram(binwidth = 0.5, color="black", fill="#333333") +
+          facet_wrap(i.year~i.month, ncol=6)+
+          theme_bw() +
+                  ggtitle(paste("Meter ",params$meteridentifier, " | Histogram from",
+                      format(count(volts_raw),big.mark=",",scientific=FALSE), 
+                      "Intervals |", 
+                      format(length(unique(volts_raw$Meter)),big.mark=",",scientific=FALSE),  
+                      "Meters |",
+                      length(unique(volts_raw$i.dtReadDay)), 
+                      "day(s) | binwidth = 0.5"
+                      ))
+
+```
+
+
+
+### Heatmap
+
+```{r Plot heatmap of each individual meter in dataframe meters, fig.height=8, fig.width=16}
+      volts_raw$hm.end <- factor(volts_raw$hm.end)
+      volts_raw$interval<-as.numeric(volts_raw$hm.end)
+
+      p <-ggplot(volts_raw,aes(i.day,interval,fill=V))+
+      geom_tile(color= "white",size=0) +
+      scale_fill_viridis(name=" Voltage",option ="C")
+      p <-p + facet_grid(i.year~i.month) # This would work for each substation as well.
+
+      #p <-p + scale_y_continuous(trans = "reverse", breaks = c(1,12,24,36,48,60,72,84,96))
+      p <-p + scale_y_continuous( breaks = c(1,12,24,36,48,60,72,84,96))
+      
+      p <-p + scale_x_continuous(breaks =c(1,10,20,31))
+      p <-p + theme_minimal(base_size = 16)
+      p <-p + labs( x="Day", y="Hour Minute Commencing")
+      p <-p + theme(legend.position = "bottom") +
+      theme(plot.title=element_text(size = 18))+
+      theme(axis.text.y=element_text(size=6)) +
+      theme(strip.background = element_rect(colour="white"))+
+      theme(plot.title=element_text(hjust=0))+
+      theme(axis.ticks=element_blank())+
+      theme(axis.text=element_text(size=7))+
+      theme(legend.title=element_text(size=8))+
+      theme(legend.text=element_text(size=6))+
+      theme(panel.spacing.x=unit(0, "lines"),panel.spacing.y=unit(0.25, "lines")) +
+                ggtitle(paste("Voltage for Meter -",params$meteridentifier, " | ",
+                      format(count(volts_raw),big.mark=",",scientific=FALSE), 
+                      "Intervals |", 
+                      format(length(unique(volts_raw$Meter)),big.mark=",",scientific=FALSE),  
+                      "Meters |",
+                      length(unique(volts_raw$i.dtReadDay)), 
+                      "day(s)"
+                      ))+  
+      removeGrid()#ggExtra
+      p
+      
+```
+
+### Load Shape Scaled Data
+Scaled data is the current value / max value in the data.
+
+```{r Load Shape, fig.height=8, fig.width=16}
+      ggplot(data=volts_raw,aes(x=i.dtReadDate ,y=volts_raw$V.scale)) +
+        geom_line(alpha = 1/1) +
+        #scale_y_continuous(limits = c(110,130)) +
+        facet_wrap(~i.year, ncol=1) +
+        theme_bw() +
+        ylab("Voltage Scaled") +
+        xlab("Day") +
+        theme(legend.position="none")  +
+        #scale_x_discrete(breaks=c("00:00","04:00","08:00","12:00","16:00","20:00")) +
+        ggtitle(paste("Meter ",params$meteridentifier, " | Load Curves from",
+                      format(count(volts_raw),big.mark=",",scientific=FALSE), 
+                      "Intervals |", 
+                      format(length(unique(volts_raw$Meter)),big.mark=",",scientific=FALSE),  
+                      "Meters |",
+                      length(unique(volts_raw$i.dtReadDay)), 
+                      "day(s)"
+                      ))
+
+
+```
+
+
+# Data
+
+```{r Voltage Summaries for Meters By Month}
+
+v_yearmonthmeter <- volts_raw %>%
+  group_by(Substation, Location, Meter, i.year, i.month, voltage.bucket)  %>%
+  summarise( voltage.min = min(V),
+             voltage.mean = mean(V),
+             voltage.median = median(as.numeric(V)),
+             voltage.max = max(V), 
+             v.intervals = n())  %>% 
+  arrange(Substation, Location, Meter, i.year, i.month, voltage.bucket)
+
+
+```
+
+```{r Summary Year Month By Substation}
+# Review the total counts for voltage in each substation this goes with scatter plots 
+# in bivar. or multivariate data
+
+v_ym_results <-
+  v_yearmonthmeter %>% 
+    group_by(Substation, i.year, i.month, voltage.bucket) %>% 
+    summarise(count = sum(v.intervals))  %>% 
+        arrange(Substation, i.year, i.month, voltage.bucket)
+
+# pivot the data for easy review
+v_ym_results <- spread(v_ym_results, voltage.bucket, count)
+# Replace .na values here
+v_ym_results[is.na(v_ym_results)] <- 0
+
+
+
+# what to do when the columns are missing or null
+if(!"(0,114]" %in% colnames(v_ym_results))
+{
+  v_ym_results$"(0,114]" <- NA 
+}
+
+# what to do when the columns are missing or null
+if(!"(126,140]" %in% colnames(v_ym_results))
+{
+  v_ym_results$"(0,114]" <- NA 
+}
+
+v_ym_results$total <- 
+  v_ym_results$`(0,114]` +
+  v_ym_results$`(114,120]` +
+  v_ym_results$`(120,126]` +
+  v_ym_results$`(126,140]`
+
+# calculate the percent for each bucket
+v_ym_results$Low <- 
+  100*(v_ym_results$`(0,114]`/v_ym_results$total)
+
+v_ym_results$Mid <- 
+  100*(v_ym_results$`(114,120]`/v_ym_results$total)
+
+v_ym_results$Nominal <- 
+  100*(v_ym_results$`(120,126]`/v_ym_results$total)
+
+v_ym_results$High <- 
+  100*(v_ym_results$`(126,140]`/v_ym_results$total)
+```
+
+
+```{r Add link to sub reports}
+
+v_ym_results$View <- paste0("[View]","(",
+                            params$href,
+                            v_ym_results$Substation,
+                            v_ym_results$i.year,
+                            v_ym_results$i.month,
+                            ".html",
+                            ")")
+
+v_ym_results$View <- paste0("[View]", "(", params$href ,"SubstationByMonth.html)")
+
+```
+
+Sorting by Substation to help ease the manual review of the data.  Low, Mid, Nominal and High values are the percentages of intervals in this range.
+
+```{r Voltage Sub Year Month with Low percentanges above zero}
+kable(v_ym_results[order(v_ym_results$i.month),])
+```
+
+# Notes
+
+* Reading with a voltage of zero {0} will be removed.
+* Duplicate removal is turned off
+
+## Ending Intervals
+Electric industy practices use ending interval notation.  An example is provided below in 15min intervals:
+
+Interval Date    | Value            | Interval Belongs to Day
+-----------------|------------------|-------------------
+**01/01/2000 00:00** | 12/31/1999 23:45 | **12/31/1999**
+01/01/2000 00:15 | 01/01/2000 00:00 | 01/01/2000
+01/01/2000 00:30 | 01/01/2000 00:15 | 01/01/2000
+01/01/2000 00:45 | 01/01/2000 00:30 | 01/01/2000
+01/01/2000 01:00 | 01/01/2000 00:45 | 01/01/2000
+01/01/2000 01:15 | 01/01/2000 01:00 | 01/01/2000
+01/01/2000 01:30 | 01/01/2000 01:15 | 01/01/2000
+01/01/2000 01:45 | 01/01/2000 01:30 | 01/01/2000
+01/01/2000 02:00 | 01/01/2000 01:45 | 01/01/2000
+...              |                  |
+01/01/2000 21:15 | 01/01/2000 21:00 | 01/01/2000
+01/01/2000 21:30 | 01/01/2000 21:15 | 01/01/2000
+01/01/2000 21:45 | 01/01/2000 21:30 | 01/01/2000
+01/01/2000 22:00 | 01/01/2000 21:45 | 01/01/2000
+01/01/2000 22:15 | 01/01/2000 22:00 | 01/01/2000
+01/01/2000 22:30 | 01/01/2000 22:15 | 01/01/2000
+01/01/2000 22:45 | 01/01/2000 22:30 | 01/01/2000
+01/01/2000 23:00 | 01/01/2000 22:45 | 01/01/2000
+01/01/2000 23:15 | 01/01/2000 23:00 | 01/01/2000
+01/01/2000 23:30 | 01/01/2000 23:15 | 01/01/2000
+01/01/2000 23:45 | 01/01/2000 23:30 | 01/01/2000
+**01/02/2000 00:00** | 01/01/2000 23:45 | **01/01/2000**
+
+## Bucket Explanations
+
+Description | Value       | Representation
+------------|-------------|-------------------
+Low         |  (0,114]    | >   0 and <= 114  
+Mid         |  (114,120]  | > 114 and <= 120  
+Nominal     |  (120,126]  | > 120 and <= 126  
+High        |  (126,140]  | > 126 and <= 140 
+
+## Configuration
+Pass in the workingdir as "J:/ElectSolve/Blue/Rcode", or where the directory is located.
+This can be done from the r script which creates the report. 
+
+Depending on the install location for the mark down file (.Rmd) the working directoty should be something 
+similar to setwd("J:/ElectSolve/Blue/Rcode").   
+
+## Parameters
+
+#### Cut variables
+cut1 : `r params$cut1`  
+cut2 : `r params$cut2`  
+cut3 : `r params$cut3`  
+cut4 : `r params$cut4`   
+cut5 : `r params$cut5`  
+Used to slice the data in different categories.
+
+#### Lower Percent
+This variable is used to reduce the number of meters we return when viewing the result in plot Comparisons of Meters By Month 
+
+lowpercent: `r params$lowpercent` 
+
+#### Set Working Direcory
+
+production: `r params$production`  
+localwin: `r params$localwin`  
+localnix: `r params$localnix`  
+
+### Query
+`r sSQLcmd`
+
+## References
+* Use Value current/Max(Value) for smoothing.
+* Use Log Returns to normalize the data. eg.. log(Today's Value/ Yesterday's Value).
+* Do we need auto-correlation to see if yesterday's data has an affect on today's data.
+* Scatter Matrix, do we have correlation between meters, meter which behave the same? 
+* Do meters have specific behaviors we can flag day to day before a trend develops, a trend we want to avoid, one that occurred historically?
+* What about meters dropping intervals... what percentage of meters not reporting in is bad?
+* What percentage of zeros is bad or affects the results?
+* We have a handful of variables maybe there should be a weighted formula to figure out who is the worst performer.
+  * Temperature
+  * Voltage
+  * Time of Day
+  * Location (Hot arid, by ocean {salty air}, humidity, etc ...)
+  * Line Conditions
+* [Code Repository](https://electsolve.kilnhg.com/Code/RCode/Group/SubstationReport)
