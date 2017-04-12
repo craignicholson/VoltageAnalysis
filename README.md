@@ -46,7 +46,7 @@ This report process a years worth of data and we need to understand how we can
 do this with less than good server specifications (RAM).
 
 ## Substation Voltage By Year
-
+```sql
 sSQLcmd <- paste("DECLARE @AMIReadSourceId INT 
                   SET @AMIReadSourceId = (  
                         SELECT ReadSourceId from   
@@ -76,3 +76,4 @@ sSQLcmd <- paste("DECLARE @AMIReadSourceId INT 
                     AND ReadValue > 0
                   "
                     ) 
+```
